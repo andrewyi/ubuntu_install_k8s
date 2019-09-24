@@ -1,0 +1,31 @@
+---
+
+# test delegate
+
+
+- hosts: master
+  gather_facts: false
+
+  tasks:
+
+    - name: Run command
+      command: bash -c 'echo "this is from $(hostname)"'
+      register: cmd_res
+
+    - name: Run command
+      set_fact:
+        master_output: "{{ cmd_res.stdout }}"
+      delegate_to: "{{ item }}"
+      delegate_facts: true
+      loop: "{{ groups['all'] }}"
+
+- hosts: worker
+  gather_facts: false
+
+  tasks:
+    - name: Run command
+      debug:
+        var: master_output
+
+
+    
