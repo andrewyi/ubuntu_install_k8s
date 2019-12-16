@@ -8,17 +8,13 @@
   tasks:
     - name: Setup all variables
       set_fact:
-        k8s_version: 1.15.0
-        pkg_version: 1.15.0-00
-
-        docker_gpg_url: https://download.docker.com/linux/ubuntu/gpg
-        docker_gpg_url_cn: https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg 
-        docker_repo: deb https://download.docker.com/linux/ubuntu bionic stable
-        docker_repo_cn: deb https://mirrors.aliyun.com/docker-ce/linux/ubuntu bionic stable
-        kube_gpg_url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
-        kube_gpg_url_cn: https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg
-        kube_repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
-        kube_repo_cn: deb https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main
+        k8s_version: 1.13.3
+        pkg_version: 1.13.3-00
+        cni_version: 0.6.0-00
+        docker_gpg_url: https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg 
+        docker_repo: deb https://mirrors.aliyun.com/docker-ce/linux/ubuntu bionic stable
+        kube_gpg_url: https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg
+        kube_repo: deb https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main
 
 
 
@@ -26,30 +22,7 @@
 
 - hosts: all
 
-  vars:
-    docker_daemon_json_config: |
-      {
-        "exec-opts": ["native.cgroupdriver=systemd"],
-        "log-driver": "json-file",
-        "log-opts": {
-          "max-size": "100m"
-        },
-        "storage-driver": "overlay2",
-        "storage-opts": [
-          "overlay2.override_kernel_check=true"
-        ]
-      }
-
   tasks:
-
-    # - name: Disable SELinux # NOTE: no need in debian systems
-    # selinux:
-    # state: disabled
-
-    # - name: Set SELinux in permissive mode # NOTE: no need in debian systems
-    # command: setenforce 0
-    # ignore_errors: true
-    # changed_when: false
 
     - name: Disable swap
       command: swapoff -a
@@ -67,55 +40,24 @@
         regexp: '^([^#]+?\sswap\s+sw\s+.*)$'
         replace: '# \1'
 
-    - name: Ensure cloud config settings to allow persist hostname
-      lineinfile:
-        regexp: '^preserve_hostname: (false|true)$'
-        line: "preserve_hostname: true"
-        state: present
-        path: /etc/cloud/cloud.cfg
-      ignore_errors: yes
-
-    - name: Set hostname
-      hostname:
-        name: "{{ inventory_hostname }}"
-
-    - name: Update hosts file with hostname
-      lineinfile:
-        regexp: "127.0.0.1 {{ inventory_hostname }}"
-        line: "127.0.0.1 {{ inventory_hostname }}"
-        state: present
-        path: /etc/hosts
-
-    - name: Ensure hosts entries exist in /etc/hosts on every node
-      lineinfile:
-        regex: "{{ hostvars[item]['ansible_facts']['eth0']['ipv4']['address'] }} {{ hostvars[item]['ansible_facts']['hostname'] }}"
-        line: "{{ hostvars[item]['ansible_facts']['eth0']['ipv4']['address'] }} {{ hostvars[item]['ansible_facts']['hostname'] }}"
-        state:  present
-        path: /etc/hosts
-      loop: "{{ groups['all'] }}"
-
-    - name: Do sync
-      command: bash -c "sync && sleep 3 && sync"
+    - name: Do sync (may be not helpful)
+      shell:
+        cmd: sync && sync -f && sleep 3 && sync && sync -f
       changed_when: false
-
-    - name: Make a reboot
-      reboot:
-        connect_timeout: 5
-        reboot_timeout: 300
-      ignore_errors: true # i found that reconnect may not working
 
     - name: Install required apt packages
       apt:
         name:
-          - aptitude
-          - apt-transport-https
           - ca-certificates
           - curl
+          - aptitude
+          - apt-transport-https
           - software-properties-common
-          - python3-pip
           - virtualenv
-          - python3-setuptools
+          - python-apt
           - python3-apt
+          - python3-setuptools
+          - python3-pip
         state: present
         update_cache: yes
 
@@ -137,7 +79,7 @@
 
     - name: Ensure docker cgroup driver
       copy:
-        content: "{{ docker_daemon_json_config }}"
+        src: ./etc_docker_daemon.json
         dest: /etc/docker/daemon.json
       notify:
         - Restart docker
@@ -155,9 +97,10 @@
     - name: Ensure latest kube-utils installed
       apt:
         name: 
+          - kubeadm={{ pkg_version }}
           - kubelet={{ pkg_version }}
           - kubectl={{ pkg_version }}
-          - kubeadm={{ pkg_version }}
+          - kubernetes-cni={{ cni_version }}
         state:  present
         update_cache: yes
       notify:
@@ -193,21 +136,24 @@
           - init
           - --pod-network-cidr=10.244.0.0/16
           - --kubernetes-version={{ k8s_version }}
+          - --image-repository=gcr.azk8s.cn/google_containers
+        creates: /etc/kubernetes/admin.conf
 
     - name: Ensure .kube directory exists
       file:
-        path: "{{ ansible_facts['env']['HOME'] }}/.kube"
-        owner: "{{ ansible_facts['env']['USER'] }}"
-        group : "{{ ansible_facts['env']['USER'] }}"
+        path: /root/.kube
         state: directory
 
-    - name: Setup kubectl config 
+    - name: Setup kubectl config
       copy:
         remote_src: yes
-        src: /etc/kubernetes/admin.conf 
-        dest: "{{ ansible_facts['env']['HOME'] }}/.kube/config"
-        owner: "{{ ansible_facts['env']['USER'] }}"
-        group : "{{ ansible_facts['env']['USER'] }}"
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+
+    - name: Send cni yaml
+      copy:
+        src: ./canal/
+        dest: /root/canal
 
     - name: Apply cni
       command:
@@ -215,17 +161,37 @@
           - kubectl
           - apply
           - -f
-          - https://docs.projectcalico.org/v3.8/manifests/canal.yaml
+          - ./{{ item }}
+        chdir: /root/canal
+      loop:
+        - rbac.yaml
+        - canal.yaml
 
     - name: Wait until cni ready
-      shell: bash -c "kubectl -nkube-system get pods | grep canal"
+      shell:
+        cmd: kubectl -nkube-system get pods | grep canal
       register: result
       until: result.stdout.find("Running") != -1
       retries: 100
       delay: 10
 
+    - name: Untaint controll plane
+      command:
+        argv:
+          - kubectl
+          - taint
+          - nodes
+          - --all
+          - node-role.kubernetes.io/master-
+      ignore_errors: true
+
     - name: Retrive kube-join command
-      command: kubeadm token create --print-join-command
+      command:
+        argv:
+          - kubeadm
+          - token
+          - create
+          - --print-join-command
       register: kubeadm_join_command_res
       changed_when: false
 
@@ -236,12 +202,31 @@
       delegate_facts: true
       loop: "{{ groups['all'] }}"
 
+    - name: Ensure workspace exists
+      file:
+        path: /root/workspace/tools
+        state: directory
+
+    - name: Send helm
+      unarchive:
+        src: ./helm-v2.16.1-linux-amd64.tar.gz
+        dest: /root/workspace/tools
+        creates: /root/workspace/tools/linux-amd64
+
+    - name: Set helm path
+      lineinfile:
+        regexp: "export PATH=/root/workspace/tools/linux-amd64:${PATH}"
+        line: "export PATH=/root/workspace/tools/linux-amd64:${PATH}"
+        state: present
+        path: "/root/.bashrc"
+
+
+
 - hosts: worker
   gather_facts: false
 
   tasks:
-    - name: Run kubeadm join on worker
-      command: "{{ kubeadm_join_command }}"
-
-
-    
+    - name: Run kubeadm join on workers
+      shell:
+        cmd: "{{ kubeadm_join_command }}"
+        creates: /etc/kubernetes/kubelet.conf
